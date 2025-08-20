@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TFmini-S Live on Web Serial</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    .card { max-width: 720px; border: 1px solid #ddd; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    h1 { margin: 0 0 12px; font-size: 1.25rem; }
+    button { font-size: 1rem; padding: 10px 16px; border-radius: 8px; border: none; background: #1abc9c; color: white; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 12px; margin-top: 12px; }
+    .metric { background: #fafafa; border: 1px solid #eee; border-radius: 10px; padding: 12px; }
+    .label { color: #666; font-size: 0.9rem; }
+    .value { font-size: 1.4rem; font-weight: 600; }
+    pre { background: #0b1020; color: #aee; padding: 12px; border-radius: 10px; max-height: 220px; overflow: auto; }
+    .warn { color: #a00; margin-top: 8px; }
+    canvas { width: 100%; height: 220px; border: 1px solid #eee; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>TFmini-S Live (UNO → Browser via Web Serial)</h1>
+    <p>
+      <button id="connectBtn">🔌 Connect sensor</button>
+      <span id="status"></span>
+    </p>
+
+    <div class="grid">
+      <div class="metric">
+        <div class="label">Distance (in)</div>
+        <div class="value" id="distVal">—</div>
+      </div>
+      <div class="metric">
+        <div class="label">Count</div>
+        <div class="value" id="countVal">—</div>
+      </div>
+      <div class="metric">
+        <div class="label">Strength</div>
+        <div class="value" id="strVal">—</div>
+      </div>
+    </div>
+
+    <h3>Recent data</h3>
+    <canvas id="plot"></canvas>
+
+    <h3>Raw feed (JSON lines)</h3>
+    <pre id="log"></pre>
+
+    <p class="warn" id="supportMsg" hidden>
+      Your browser doesn’t appear to support the Web Serial API. Please use the latest Chrome or Microsoft Edge on desktop.
+    </p>
+  </div>
+
+  <script>
+    const connectBtn = document.getElementById('connectBtn');
+    const statusEl   = document.getElementById('status');
+    const distEl     = document.getElementById('distVal');
+    const countEl    = document.getElementById('countVal');
+    const strEl      = document.getElementById('strVal');
+    const logEl      = document.getElementById('log');
+    const supportMsg = document.getElementById('supportMsg');
+
+    const plotEl     = document.getElementById('plot');
+    const ctx        = plotEl.getContext('2d');
+
+    if (!('serial' in navigator)) {
+      supportMsg.hidden = false;
+      connectBtn.disabled = true;
+    }
+
+    let reader, port, keepReading = false;
+    let lineBuffer = '';
+
+    // Simple rolling arrays for plotting
+    const MAX_POINTS = 120; // ~last 120 readings
+    const dataDist = [];
+    const dataCount = [];
+    const dataStr = [];
+
+    function pushAndTrim(arr, v) { arr.push(v); if (arr.length > MAX_POINTS) arr.shift(); }
+
+    function drawPlot() {
+      const w = plotEl.width = plotEl.clientWidth;
+      const h = plotEl.height = plotEl.clientHeight;
+
+      // Draw axes
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = '#ccc';
+      ctx.beginPath();
+      ctx.moveTo(40, 10); ctx.lineTo(40, h-30); ctx.lineTo(w-10, h-30);
+      ctx.stroke();
+
+      // Determine y ranges
+      const dd = dataDist.length ? dataDist : [0];
+      const dc = dataCount.length ? dataCount : [0];
+      const ds = dataStr.length ? dataStr : [0];
+
+      const minY = 0;
+      const maxY = Math.max(
+        Math.max(...dd) + 1,
+        Math.max(...dc) + 1,
+        Math.max(...ds) + 100
+      );
+
+      // Helper to plot one series
+      function plotSeries(arr) {
+        if (arr.length < 2) return;
+        const plotW = w - 50;
+        const plotH = h - 40;
+        ctx.beginPath();
+        arr.forEach((v, i) => {
+          const x = 40 + (i * (plotW / (MAX_POINTS - 1)));
+          const y = (h - 30) - ((v - minY) / (maxY - minY)) * plotH;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+
+      // Distance, Count, Strength (drawn in default canvas colors)
+      ctx.lineWidth = 1.5;
+      plotSeries(dataDist);
+      plotSeries(dataCount);
+      plotSeries(dataStr);
+    }
+
+    async function connect() {
+      try {
+        statusEl.textContent = ' Requesting port…';
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        const decoder = new TextDecoderStream();
+        const inputDone = port.readable.pipeTo(decoder.writable);
+        const inputStream = decoder.readable;
+        reader = inputStream.getReader();
+
+        statusEl.textContent = ' Connected. Reading…';
+        connectBtn.disabled = true;
+        keepReading = true;
+        readLoop().catch(console.error);
+      } catch (e) {
+        statusEl.textContent = ' ' + (e && e.message ? e.message : 'Connection failed');
+      }
+    }
+
+    async function readLoop() {
+      while (keepReading) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          lineBuffer += value;
+          let idx;
+          while ((idx = lineBuffer.indexOf('\n')) >= 0) {
+            const line = lineBuffer.slice(0, idx).trim();
+            lineBuffer = lineBuffer.slice(idx + 1);
+            handleLine(line);
+          }
+        }
+      }
+    }
+
+    function handleLine(line) {
+      // We only parse lines that look like JSON objects { ... }
+      if (!line.startsWith('{')) {
+        // Show a little of the human-readable output too
+        appendLog(line);
+        return;
+      }
+      try {
+        const obj = JSON.parse(line);
+
+        const d  = Number(obj.dist_in) || 0;
+        const c  = Number(obj.count) || 0;
+        const st = Number(obj.strength) || 0;
+
+        distEl.textContent  = d.toFixed(2);
+        countEl.textContent = c.toString();
+        strEl.textContent   = st.toString();
+
+        pushAndTrim(dataDist, d);
+        pushAndTrim(dataCount, c);
+        pushAndTrim(dataStr, st);
+        drawPlot();
+
+        appendLog(line);
+      } catch (e) {
+        appendLog('Parse error: ' + e);
+      }
+    }
+
+    function appendLog(s) {
+      const lines = logEl.textContent.split('\n');
+      lines.push(s);
+      while (lines.length > 200) lines.shift();
+      logEl.textContent = lines.join('\n');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    connectBtn.addEventListener('click', connect);
+
+    // Optional: gracefully close on page unload
+    window.addEventListener('beforeunload', async () => {
+      try {
+        keepReading = false;
+        if (reader) { await reader.cancel(); await reader.releaseLock(); }
+        if (port) { await port.close(); }
+      } catch (_) {}
+    });
+  </script>
+</body>
+</html>
+
